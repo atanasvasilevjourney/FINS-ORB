@@ -1,0 +1,200 @@
+//@version=5
+strategy("NQ ORB (Apex/Topstep Low-Risk)", overlay=true, initial_capital=50000, pyramiding=0, process_orders_on_close=true)
+
+// -------------------------
+// Risk disclaimer
+// -------------------------
+// Past results and strategy tester reports do not indicate future performance.
+// Guarantees do not exist in trading. By using this strategy you risk losing all your money.
+
+// -------------------------
+// Inputs
+// -------------------------
+symbolLock     = input.string("MNQ1!", "Allowed Ticker (hard lock)")
+openRangeSess  = input.session("0930-0945", "Opening Range Time (NY)")
+tradeSess      = input.session("0945-1400", "Session Time (NY)")
+tradeTf        = input.timeframe("15", "Trade Timeframe")
+slBufferPts    = input.float(0.0, "Stop Loss Buffer in Points", minval=0)
+profitFactor   = input.float(4.0, "Profit Target Factor", minval=0.1)
+maxSlPoints    = input.float(80.0, "Maximum SL Size (Points)", minval=0.25)
+
+useTrailing    = input.bool(true, "Use Trailing Stop Loss")
+trailActivate  = input.float(20.0, "Trailing Stop Activation (Points)", minval=0.25)
+trailBuffer    = input.float(8.0, "Trailing Stop Buffer (Points)", minval=0.25)
+
+riskType       = input.string("Fixed Contract Size", "Risk Type", options=["Fixed USD Amount", "Risk per Trade in %", "Fixed Contract Size"])
+riskAmount     = input.float(1.0, "Risk Amount (USD / % / Contracts)", minval=0.01)
+
+useLimitPullback = input.bool(true, "Use Limit Orders (hidden pullback)")
+limitDistPts     = input.float(8.0, "Limit Order Distance (Points)", minval=0.25)
+
+tradeMon = input.bool(true, "Trade Monday")
+tradeTue = input.bool(false, "Trade Tuesday")
+tradeWed = input.bool(true, "Trade Wednesday")
+tradeThu = input.bool(false, "Trade Thursday")
+tradeFri = input.bool(true, "Trade Friday")
+
+maxTradesPerDay = input.int(1, "Max Trades per Day", minval=1)
+exitTrigger     = input.string("Candle Close", "Exit Trigger Method", options=["Candle Close", "Touch"])
+
+// -------------------------
+// Guards
+// -------------------------
+isCorrectSymbol = str.contains(syminfo.tickerid, symbolLock)
+isCorrectTf     = timeframe.period == tradeTf
+canRun          = isCorrectSymbol and isCorrectTf
+
+if not isCorrectSymbol
+    label.new(bar_index, high, "Wrong ticker. Use " + symbolLock, style=label.style_label_down, color=color.red, textcolor=color.white)
+
+if not isCorrectTf
+    label.new(bar_index, high, "Use timeframe " + tradeTf, style=label.style_label_down, color=color.orange, textcolor=color.white)
+
+// -------------------------
+// Session helpers
+// -------------------------
+ny = "America/New_York"
+inOpenRange = not na(time(timeframe.period, openRangeSess, ny))
+inTradeSess = not na(time(timeframe.period, tradeSess, ny))
+
+nyDay = dayofweek(time, ny)
+allowedDay = (nyDay == dayofweek.monday and tradeMon) or
+     (nyDay == dayofweek.tuesday and tradeTue) or
+     (nyDay == dayofweek.wednesday and tradeWed) or
+     (nyDay == dayofweek.thursday and tradeThu) or
+     (nyDay == dayofweek.friday and tradeFri)
+
+isNewNyDay = dayofmonth(time, ny) != dayofmonth(time[1], ny) or month(time, ny) != month(time[1], ny)
+
+// -------------------------
+// State
+// -------------------------
+var float orHigh = na
+var float orLow = na
+var bool orReady = false
+var int tradesToday = 0
+var bool waitLongPullback = false
+var bool waitShortPullback = false
+var float pullbackLongPrice = na
+var float pullbackShortPrice = na
+var float curLongSL = na
+var float curShortSL = na
+var float curLongTP = na
+var float curShortTP = na
+
+if isNewNyDay
+    orHigh := na
+    orLow := na
+    orReady := false
+    tradesToday := 0
+    waitLongPullback := false
+    waitShortPullback := false
+    pullbackLongPrice := na
+    pullbackShortPrice := na
+
+if inOpenRange
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+if not inOpenRange and inOpenRange[1] and not na(orHigh) and not na(orLow)
+    orReady := true
+
+plot(orHigh, "OR High", color=color.new(color.green, 0), linewidth=2)
+plot(orLow, "OR Low", color=color.new(color.red, 0), linewidth=2)
+
+slPointsForEntry(_entry, _stop) =>
+    math.abs(_entry - _stop)
+
+calcQty(slPts) =>
+    contractRiskUsd = slPts * syminfo.pointvalue
+    q = switch riskType
+        "Fixed Contract Size" => riskAmount
+        "Fixed USD Amount"    => riskAmount / contractRiskUsd
+        => (strategy.equity * (riskAmount / 100.0)) / contractRiskUsd
+    math.max(1.0, math.floor(q))
+
+canTrade = canRun and allowedDay and inTradeSess and orReady and tradesToday < maxTradesPerDay and strategy.position_size == 0
+
+longBreak  = canTrade and close > orHigh
+shortBreak = canTrade and close < orLow
+
+if longBreak
+    stop = orLow - slBufferPts
+    slPts = slPointsForEntry(close, stop)
+    if slPts <= maxSlPoints
+        if useLimitPullback
+            waitLongPullback := true
+            pullbackLongPrice := close - limitDistPts
+        else
+            qty = calcQty(slPts)
+            strategy.entry("L", strategy.long, qty=qty)
+            curLongSL := stop
+            curLongTP := close + slPts * profitFactor
+            tradesToday += 1
+
+if shortBreak
+    stop = orHigh + slBufferPts
+    slPts = slPointsForEntry(close, stop)
+    if slPts <= maxSlPoints
+        if useLimitPullback
+            waitShortPullback := true
+            pullbackShortPrice := close + limitDistPts
+        else
+            qty = calcQty(slPts)
+            strategy.entry("S", strategy.short, qty=qty)
+            curShortSL := stop
+            curShortTP := close - slPts * profitFactor
+            tradesToday += 1
+
+if waitLongPullback and inTradeSess and low <= pullbackLongPrice and strategy.position_size == 0
+    stop = orLow - slBufferPts
+    slPts = slPointsForEntry(pullbackLongPrice, stop)
+    if slPts <= maxSlPoints
+        qty = calcQty(slPts)
+        strategy.entry("L", strategy.long, qty=qty)
+        curLongSL := stop
+        curLongTP := pullbackLongPrice + slPts * profitFactor
+        tradesToday += 1
+    waitLongPullback := false
+
+if waitShortPullback and inTradeSess and high >= pullbackShortPrice and strategy.position_size == 0
+    stop = orHigh + slBufferPts
+    slPts = slPointsForEntry(pullbackShortPrice, stop)
+    if slPts <= maxSlPoints
+        qty = calcQty(slPts)
+        strategy.entry("S", strategy.short, qty=qty)
+        curShortSL := stop
+        curShortTP := pullbackShortPrice - slPts * profitFactor
+        tradesToday += 1
+    waitShortPullback := false
+
+if strategy.position_size > 0
+    entry = strategy.position_avg_price
+    profitPts = close - entry
+    if useTrailing and profitPts >= trailActivate
+        newSL = close - trailBuffer
+        curLongSL := na(curLongSL) ? newSL : math.max(curLongSL, newSL)
+
+if strategy.position_size < 0
+    entry = strategy.position_avg_price
+    profitPts = entry - close
+    if useTrailing and profitPts >= trailActivate
+        newSL = close + trailBuffer
+        curShortSL := na(curShortSL) ? newSL : math.min(curShortSL, newSL)
+
+if strategy.position_size > 0
+    if exitTrigger == "Touch"
+        strategy.exit("XL", "L", stop=curLongSL, limit=curLongTP)
+    else
+        if close <= curLongSL or close >= curLongTP
+            strategy.close("L")
+
+if strategy.position_size < 0
+    if exitTrigger == "Touch"
+        strategy.exit("XS", "S", stop=curShortSL, limit=curShortTP)
+    else
+        if close >= curShortSL or close <= curShortTP
+            strategy.close("S")
+
+if not inTradeSess and strategy.position_size != 0
+    strategy.close_all("Session end flat")
